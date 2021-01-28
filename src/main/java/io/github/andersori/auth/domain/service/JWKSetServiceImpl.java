@@ -3,19 +3,25 @@ package io.github.andersori.auth.domain.service;
 import com.nimbusds.jose.jwk.JWK;
 import com.nimbusds.jose.jwk.KeyUse;
 import com.nimbusds.jose.jwk.RSAKey;
-import java.io.*;
+import java.io.File;
+import java.io.FileOutputStream;
+import java.io.IOException;
+import java.io.SequenceInputStream;
 import java.nio.ByteBuffer;
 import java.nio.charset.Charset;
 import java.nio.charset.MalformedInputException;
 import java.nio.file.Files;
 import java.security.KeyFactory;
 import java.security.NoSuchAlgorithmException;
+import java.security.PrivateKey;
+import java.security.PublicKey;
 import java.security.interfaces.RSAPrivateCrtKey;
 import java.security.interfaces.RSAPublicKey;
 import java.security.spec.PKCS8EncodedKeySpec;
 import java.security.spec.RSAPublicKeySpec;
 import java.util.*;
 import java.util.stream.Collectors;
+import org.apache.commons.lang3.tuple.Pair;
 import org.springframework.core.io.ClassPathResource;
 import org.springframework.core.io.buffer.DataBuffer;
 import org.springframework.http.codec.multipart.FilePart;
@@ -42,17 +48,16 @@ public class JWKSetServiceImpl implements JWKSetService {
               return Flux.fromArray(
                   Objects.requireNonNull(
                       files.listFiles(
-                          (file) -> {
-                            return file.isFile()
-                                && Set.of("pem", "key", "der")
-                                    .contains(
-                                        com.google.common.io.Files.getFileExtension(
-                                            file.getName()));
-                          })));
+                          (file) ->
+                              file.isFile()
+                                  && Set.of("pem", "key", "der")
+                                      .contains(
+                                          com.google.common.io.Files.getFileExtension(
+                                              file.getName())))));
             })
         .flatMap(
             file ->
-                /*First try -> PEM key*/
+                /*First try -> PEM key on PKCS8 format*/
                 Mono.fromCallable(() -> Files.readString(file.toPath(), Charset.defaultCharset()))
                     .map(
                         content ->
@@ -62,8 +67,8 @@ public class JWKSetServiceImpl implements JWKSetService {
                                 .replace("-----END PRIVATE KEY-----", ""))
                     .map(privateKey -> ByteBuffer.wrap(Base64.getDecoder().decode(privateKey)))
                     /*Second try -> DER key*/
+                    /** MalformedInputException.class IllegalArgumentException.class */
                     .onErrorResume(
-                        MalformedInputException.class,
                         ex ->
                             Mono.fromCallable(
                                     () -> ByteBuffer.wrap(Files.readAllBytes(file.toPath())))
@@ -122,7 +127,9 @@ public class JWKSetServiceImpl implements JWKSetService {
                                                   String newPrivateKeyName =
                                                       UUID.randomUUID().toString();
                                                   List<String> filesSystem =
-                                                      Arrays.stream(fileDir.listFiles(File::isFile))
+                                                      Arrays.stream(
+                                                              Objects.requireNonNull(
+                                                                  fileDir.listFiles(File::isFile)))
                                                           .map(File::getName)
                                                           .collect(Collectors.toList());
                                                   for (int i = 0; i < filesSystem.size(); i++) {
@@ -148,7 +155,21 @@ public class JWKSetServiceImpl implements JWKSetService {
                                                                         .getFileExtension(
                                                                             file.filename())));
 
-                                                    out.write(inputStream.readAllBytes());
+                                                    String content =
+                                                        new String(inputStream.readAllBytes());
+                                                    if (content.contains(
+                                                        "-----BEGIN PRIVATE KEY-----")) {
+                                                      out.write(content.getBytes());
+                                                    } else if (content.contains(
+                                                        "-----BEGIN ENCRYPTED PRIVATE KEY-----")) {
+                                                      return Mono.error(
+                                                          new IllegalArgumentException(
+                                                              "Please, do not provide an encrypted key"));
+                                                    } else {
+                                                      return Mono.error(
+                                                          new IllegalArgumentException(
+                                                              "Please, provide key in PKCS8 format"));
+                                                    }
 
                                                     return Mono.empty();
                                                   } catch (IOException e) {
@@ -156,5 +177,58 @@ public class JWKSetServiceImpl implements JWKSetService {
                                                   }
                                                 }))))
         .then();
+  }
+
+  @Override
+  public Mono<Pair<PrivateKey, PublicKey>> getKey(String kid) {
+    return Mono.fromCallable(() -> new ClassPathResource("/key"))
+        .flatMap(resource -> Mono.fromCallable(() -> new File(resource.getURI())))
+        .flatMap(
+            files -> {
+              if (files.listFiles() == null) {
+                return Mono.empty();
+              }
+              return Mono.justOrEmpty(
+                  Arrays.stream(
+                          Objects.requireNonNull(
+                              files.listFiles(
+                                  (file) -> file.isFile() && file.getName().contains(kid))))
+                      .findFirst());
+            })
+        .flatMap(
+            file -> /*First try -> PEM key*/
+                Mono.fromCallable(() -> Files.readString(file.toPath(), Charset.defaultCharset()))
+                    .map(
+                        content ->
+                            content
+                                .replace("-----BEGIN PRIVATE KEY-----", "")
+                                .replaceAll(System.lineSeparator(), "")
+                                .replace("-----END PRIVATE KEY-----", ""))
+                    .map(privateKey -> ByteBuffer.wrap(Base64.getDecoder().decode(privateKey)))
+                    /*Second try -> DER key*/
+                    .onErrorResume(
+                        MalformedInputException.class,
+                        ex ->
+                            Mono.fromCallable(
+                                    () -> ByteBuffer.wrap(Files.readAllBytes(file.toPath())))
+                                /*In case of an error with this file, ignore them*/
+                                .onErrorResume(ex1 -> Mono.empty()))
+                    .map(byteBuffer -> new PKCS8EncodedKeySpec(byteBuffer.array()))
+                    .flatMap(
+                        privateSpec ->
+                            Mono.fromCallable(() -> KEY_FACTORY.generatePrivate(privateSpec))
+                                .onErrorResume(ex -> Mono.empty())))
+        .flatMap(
+            privateKey ->
+                Mono.just((RSAPrivateCrtKey) privateKey)
+                    .flatMap(
+                        rsaPrivateKey ->
+                            Mono.fromCallable(
+                                () ->
+                                    KEY_FACTORY.generatePublic(
+                                        new RSAPublicKeySpec(
+                                            rsaPrivateKey.getModulus(),
+                                            rsaPrivateKey.getPublicExponent()))))
+                    .map(publicKey -> Pair.of(privateKey, publicKey)));
   }
 }
